@@ -74,8 +74,6 @@ class ModelBase():
     arguments: :class:`argparse.Namespace`
         The arguments that were passed to the train or convert process as generated from
         Faceswap's command line arguments
-    training_image_size: int, optional
-        The size of the training images in the training folder. Default: `256`
     predict: bool, optional
         ``True`` if the model is being loaded for inference, ``False`` if the model is being loaded
         for training. Default: ``False``
@@ -94,10 +92,9 @@ class ModelBase():
         with the trainer name that a model requires in the model plugin's
         :func:`__init__` function.
     """
-    def __init__(self, model_dir, arguments, training_image_size=256, predict=False):
-        logger.debug("Initializing ModelBase (%s): (model_dir: '%s', arguments: %s, "
-                     "training_image_size: %s, predict: %s)",
-                     self.__class__.__name__, model_dir, arguments, training_image_size, predict)
+    def __init__(self, model_dir, arguments, predict=False):
+        logger.debug("Initializing ModelBase (%s): (model_dir: '%s', arguments: %s, predict: %s)",
+                     self.__class__.__name__, model_dir, arguments, predict)
 
         self.input_shape = None  # Must be set within the plugin after initializing
         self.trainer = "original"  # Override for plugin specific trainer
@@ -120,8 +117,7 @@ class ModelBase():
         self._state = State(model_dir,
                             self.name,
                             self._config_changeable_items,
-                            False if self._is_predict else self._args.no_logs,
-                            training_image_size)
+                            False if self._is_predict else self._args.no_logs)
         self._settings = _Settings(self._args,
                                    self.config["mixed_precision"],
                                    self.config["allow_growth"],
@@ -143,13 +139,15 @@ class ModelBase():
 
     @property
     def coverage_ratio(self):
-        """ float: The ratio of the training image to crop out and train on. """
-        coverage_ratio = self.config.get("coverage", 62.5) / 100
-        logger.debug("Requested coverage_ratio: %s", coverage_ratio)
-        cropped_size = (self._state.training_size * coverage_ratio) // 2 * 2
-        retval = cropped_size / self._state.training_size
-        logger.debug("Final coverage_ratio: %s", retval)
-        return retval
+        """ float: The ratio of the training image to crop out and train on as defined in user
+        configuration options.
+
+        NB: The coverage ratio is a raw float, but will be applied to integer pixel images.
+
+        To ensure consistent rounding and guaranteed even image size, the calculation for coverage
+        should always be: :math:`(original_size * coverage_ratio // 2) * 2`
+        """
+        return self.config.get("coverage", 62.5) / 100
 
     @property
     def model_dir(self):
@@ -385,7 +383,7 @@ class ModelBase():
                                self.config.get("clipnorm", False),
                                self._args).optimizer
         if self._settings.use_mixed_precision:
-            optimizer = self._settings.LossScaleOptimizer(optimizer, loss_scale="dynamic")
+            optimizer = self._settings.loss_scale_optimizer(optimizer)
         if get_backend() == "amd":
             self._rewrite_plaid_outputs()
         self._loss.configure(self._model)
@@ -639,11 +637,15 @@ class _Settings():
         logger.debug("Initializing %s: (arguments: %s, mixed_precision: %s, allow_growth: %s, "
                      "is_predict: %s)", self.__class__.__name__, arguments, mixed_precision,
                      allow_growth, is_predict)
+        self._tf_version = [int(i) for i in tf.__version__.split(".")[:2]]
         self._set_tf_settings(allow_growth, arguments.exclude_gpus)
 
         use_mixed_precision = not is_predict and mixed_precision and get_backend() == "nvidia"
-        if use_mixed_precision:
+        # Mixed precision moved out of experimental in tf 2.4
+        if use_mixed_precision and self._tf_version[0] == 2 and self._tf_version[1] < 4:
             self._mixed_precision = tf.keras.mixed_precision.experimental
+        elif use_mixed_precision:
+            self._mixed_precision = tf.keras.mixed_precision
         else:
             self._mixed_precision = None
 
@@ -664,11 +666,24 @@ class _Settings():
         """ bool: ``True`` if mixed precision training has been enabled, otherwise ``False``. """
         return self._use_mixed_precision
 
-    @property
-    def LossScaleOptimizer(self):  # pylint:disable=invalid-name
-        """ :class:`tf.keras.mixed_precision.experimental.LossScaleOptimizer`: Shortcut to the loss
-        scale optimizer for mixed precision training. """
-        return self._mixed_precision.LossScaleOptimizer
+    def loss_scale_optimizer(self, optimizer):
+        """ Optimize loss scaling for mixed precision training.
+
+        Parameters
+        ----------
+        optimizer: :class:`tf.keras.optimizers.Optimizer`
+            The optimizer instance to wrap
+
+        Returns
+        --------
+        :class:`tf.keras.mixed_precision.loss_scale_optimizer.LossScaleOptimizer`
+            The original optimizer with loss scaling applied
+        """
+        # tf versions < 2.4 had different kwargs where scaling needs to be explicitly defined
+        vers = self._tf_version
+        kwargs = dict(loss_scale="dynamic") if vers[0] == 2 and vers[1] < 4 else dict()
+        logger.debug("tf version: %s, kwargs: %s", vers, kwargs)
+        return self._mixed_precision.LossScaleOptimizer(optimizer, **kwargs)
 
     @classmethod
     def _set_tf_settings(cls, allow_growth, exclude_devices):
@@ -708,7 +723,7 @@ class _Settings():
                 tf.config.experimental.set_memory_growth(gpu, True)
             logger.debug("Set Tensorflow 'allow_growth' option")
 
-    def _set_keras_mixed_precision(self, use_mixed_precision, skip_check):
+    def _set_keras_mixed_precision(self, use_mixed_precision, exclude_gpus):
         """ Enable the Keras experimental Mixed Precision API.
 
         Enables the Keras experimental Mixed Precision API if requested in the user configuration
@@ -719,12 +734,12 @@ class _Settings():
         use_mixed_precision: bool
             ``True`` if experimental mixed precision support should be enabled for Nvidia GPUs
             otherwise ``False``.
-        skip_check: bool
-            ``True`` if the mixed precision compatibility check should be skipped, otherwise
-            ``False``.
+        exclude_gpus: bool
+            ``True`` If connected GPUs are being excluded otherwise ``False``.
 
-            There is a bug in Tensorflow that will cause a failure if
-            "set_visible_devices" has been set and mixed_precision is enabled. Specifically in
+            There is a bug in Tensorflow 2.2 that will cause a failure if "set_visible_devices" has
+            been set and mixed_precision is enabled. This can happen if GPUs have been excluded.
+            The issue is Specifically in
             :file:`tensorflow.python.keras.mixed_precision.experimental.device_compatibility_check`
 
             From doc-string: "if list_local_devices() and tf.config.set_visible_devices() are both
@@ -735,17 +750,18 @@ class _Settings():
             already been performed. This is likely to cause some issues, but not as many as
             guaranteed failure when limiting GPU devices
         """
-        logger.debug("use_mixed_precision: %s, skip_check: %s", use_mixed_precision, skip_check)
+        logger.debug("use_mixed_precision: %s, exclude_gpus: %s",
+                     use_mixed_precision, exclude_gpus)
         if not use_mixed_precision:
             logger.debug("Not enabling 'mixed_precision' (backend: %s, use_mixed_precision: %s)",
                          get_backend(), use_mixed_precision)
             return False
         logger.info("Enabling Mixed Precision Training.")
 
-        if skip_check:
-            # TODO remove this hacky fix to disable mixed precision compatibility testing if/when
-            # fixed upstream.
-            # pylint:disable=import-outside-toplevel,protected-access
+        if exclude_gpus and self._tf_version[0] == 2 and self._tf_version[1] == 2:
+            # TODO remove this hacky fix to disable mixed precision compatibility testing when
+            # tf 2.2 support dropped
+            # pylint:disable=import-outside-toplevel,protected-access,import-error
             from tensorflow.python.keras.mixed_precision.experimental import \
                 device_compatibility_check
             logger.debug("Overriding tensorflow _logged_compatibility_check parameter. Initial "
@@ -754,7 +770,10 @@ class _Settings():
             logger.debug("New value: %s", device_compatibility_check._logged_compatibility_check)
 
         policy = self._mixed_precision.Policy('mixed_float16')
-        self._mixed_precision.set_policy(policy)
+        if self._tf_version[0] == 2 and self._tf_version[1] < 4:
+            self._mixed_precision.set_policy(policy)
+        else:
+            self._mixed_precision.set_global_policy(policy)
         logger.debug("Enabled mixed precision. (Compute dtype: %s, variable_dtype: %s)",
                      policy.compute_dtype, policy.variable_dtype)
         return True
@@ -1078,25 +1097,16 @@ class State():
         Configuration options that can be altered when resuming a model, and their current values
     no_logs: bool
         ``True`` if Tensorboard logs should not be generated, otherwise ``False``
-    training_image_size: int
-        The size of the training images in the training folder
     """
-    def __init__(self,
-                 model_dir,
-                 model_name,
-                 config_changeable_items,
-                 no_logs,
-                 training_image_size):
+    def __init__(self, model_dir, model_name, config_changeable_items, no_logs):
         logger.debug("Initializing %s: (model_dir: '%s', model_name: '%s', "
-                     "config_changeable_items: '%s', no_logs: %s, training_image_size: '%s'",
-                     self.__class__.__name__, model_dir, model_name, config_changeable_items,
-                     no_logs, training_image_size)
+                     "config_changeable_items: '%s', no_logs: %s", self.__class__.__name__,
+                     model_dir, model_name, config_changeable_items, no_logs)
         self._serializer = get_serializer("json")
         filename = "{}_state.{}".format(model_name, self._serializer.file_extension)
         self._filename = os.path.join(model_dir, filename)
         self._name = model_name
         self._iterations = 0
-        self._training_size = training_image_size
         self._sessions = dict()
         self._lowest_avg_loss = dict()
         self._config = dict()
@@ -1119,11 +1129,6 @@ class State():
     def iterations(self):
         """ int: The total number of iterations that the model has trained. """
         return self._iterations
-
-    @property
-    def training_size(self):
-        """ int: The size of the training images in the training folder. """
-        return self._training_size
 
     @property
     def lowest_avg_loss(self):
@@ -1220,7 +1225,6 @@ class State():
         self._sessions = state.get("sessions", dict())
         self._lowest_avg_loss = state.get("lowest_avg_loss", dict())
         self._iterations = state.get("iterations", 0)
-        self._training_size = state.get("training_size", 256)
         self._config = state.get("config", dict())
         logger.debug("Loaded state: %s", state)
         self._replace_config(config_changeable_items)
@@ -1232,7 +1236,6 @@ class State():
                  "sessions": self._sessions,
                  "lowest_avg_loss": self._lowest_avg_loss,
                  "iterations": self._iterations,
-                 "training_size": self._training_size,
                  "config": _CONFIG}
         self._serializer.save(self._filename, state)
         logger.debug("Saved State")
@@ -1252,11 +1255,18 @@ class State():
         """
         global _CONFIG  # pylint: disable=global-statement
         legacy_update = self._update_legacy_config()
-        # Add any new items to state config for legacy purposes
+        # Add any new items to state config for legacy purposes and set sensible defaults for
+        # any values that may have been changed in the config file which could be detrimental.
+        legacy_defaults = dict(centering="legacy",
+                               mask_loss_function="mse",
+                               l2_reg_term=100,
+                               optimizer="adam",
+                               mixed_precision=False)
         for key, val in _CONFIG.items():
             if key not in self._config.keys():
-                logger.info("Adding new config item to state file: '%s': '%s'", key, val)
-                self._config[key] = val
+                setting = legacy_defaults.get(key, val)
+                logger.info("Adding new config item to state file: '%s': '%s'", key, setting)
+                self._config[key] = setting
         self._update_changed_config_items(config_changeable_items)
         logger.debug("Replacing config. Old config: %s", _CONFIG)
         _CONFIG = self._config

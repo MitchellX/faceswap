@@ -53,10 +53,10 @@ class ScriptExecutor():  # pylint:disable=too-few-public-methods
         Raises
         ------
         FaceswapError
-            If Tensorflow is not found, or is not between versions 2.2 and 2.2
+            If Tensorflow is not found, or is not between versions 2.2 and 2.4
         """
         min_ver = 2.2
-        max_ver = 2.2
+        max_ver = 2.4
         try:
             # Ensure tensorflow doesn't pin all threads to one core when using Math Kernel Library
             os.environ["TF_MIN_GPU_MULTIPROCESSOR_COUNT"] = "4"
@@ -82,7 +82,7 @@ class ScriptExecutor():  # pylint:disable=too-few-public-methods
                    "installed. Please upgrade Tensorflow.".format(min_ver, tf_ver))
             self._handle_import_error(msg)
         if tf_ver > max_ver:
-            msg = ("The maximumum supported Tensorflow is version {} but you have version {} "
+            msg = ("The maximum supported Tensorflow is version {} but you have version {} "
                    "installed. Please downgrade Tensorflow.".format(max_ver, tf_ver))
             self._handle_import_error(msg)
         logger.debug("Installed Tensorflow Version: %s", tf_ver)
